@@ -1,0 +1,32 @@
+.wrapper {
+  width: 100vw;
+  height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0a0a2e;
+  overflow: hidden;
+}
+
+.container {
+  width: 100%;
+  max-width: 430px;
+  height: 100%;
+  max-height: 900px;
+  aspect-ratio: 400 / 650;
+  position: relative;
+}
+
+@media (min-aspect-ratio: 400/650) {
+  .container {
+    width: auto;
+    height: 100%;
+  }
+}
+
+@media (max-aspect-ratio: 400/650) {
+  .container {
+    width: 100%;
+    height: auto;
+  }
+}
