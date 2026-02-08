@@ -1,17 +1,21 @@
 import { useRef, useCallback } from 'react'
-import type { GameState, Platform, Particle, Star, Phase } from './types.ts'
+import type { GameState, Platform, Particle, LandingRing, Star, Phase } from './types.ts'
 import {
   CANVAS_WIDTH, CANVAS_HEIGHT,
-  GRAVITY, JUMP_VELOCITY, SUPER_JUMP, MAX_FALL_SPEED,
-  PLAYER_RADIUS, FRICTION_AIR,
+  GRAVITY, JUMP_VELOCITY, SUPER_JUMP, WEAK_JUMP, MAX_FALL_SPEED,
+  PLAYER_RADIUS, MOVE_ACCEL, FRICTION_AIR, CAMERA_LERP,
   PLATFORM_W, PLATFORM_H,
   PLATFORM_GAP_MIN, PLATFORM_GAP_MAX,
   INITIAL_PLATFORMS, SCROLL_LINE,
   MOVING_PLATFORM_SPEED,
   BREAKABLE_CHANCE, MOVING_CHANCE, SPRING_CHANCE,
+  COMBO_DECAY_FRAMES,
 } from './types.ts'
 import { render } from './renderer.ts'
-import { playJump, playSuperJump, playBreak, playGameOver, playMilestone } from './sound.ts'
+import {
+  playJump, playWeakJump, playSuperJump,
+  playBreak, playGameOver, playMilestone, playCombo,
+} from './sound.ts'
 
 // ── Helpers ──
 function rand(min: number, max: number) {
@@ -36,9 +40,9 @@ function makePlatform(x: number, y: number, difficulty: number): Platform {
   const r = Math.random()
   let type: Platform['type'] = 'normal'
 
-  const springChance = SPRING_CHANCE * Math.min(1.5, 0.5 + difficulty * 0.1)
-  const movingChance = MOVING_CHANCE * Math.min(2, 0.5 + difficulty * 0.15)
-  const breakableChance = BREAKABLE_CHANCE * Math.min(2.5, 0.5 + difficulty * 0.2)
+  const springChance = SPRING_CHANCE * Math.min(1.5, 0.5 + difficulty * 0.08)
+  const movingChance = MOVING_CHANCE * Math.min(2, 0.5 + difficulty * 0.12)
+  const breakableChance = BREAKABLE_CHANCE * Math.min(2.5, 0.5 + difficulty * 0.15)
 
   if (r < springChance) type = 'spring'
   else if (r < springChance + movingChance) type = 'moving'
@@ -67,32 +71,30 @@ function spawnParticles(
       x,
       y,
       vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed - 1,
+      vy: Math.sin(angle) * speed - 1.5,
       life: 20 + Math.random() * 15,
       maxLife: 35,
       color,
-      size: 2 + Math.random() * 2,
+      size: 1.5 + Math.random() * 2.5,
     })
   }
   return out
 }
 
-function getMilestone(alt: number): string | null {
-  const milestones = [500, 1000, 2000, 3000, 5000, 7500, 10000, 15000, 20000]
-  for (const m of milestones) {
-    if (alt >= m && alt - 8 < m) return `${m}m!`
-  }
-  return null
+function spawnLandingRing(x: number, y: number, color: string): LandingRing {
+  return { x, y, life: 20, maxLife: 20, color, radius: 5 }
 }
+
+const MILESTONES = [500, 1000, 2000, 3000, 5000, 7500, 10000, 15000, 20000, 30000]
 
 // ── Initial state ──
 function createInitialState(): GameState {
   const platforms: Platform[] = []
-  // Ground platform
+  // Wide ground platform
   platforms.push({
     x: CANVAS_WIDTH / 2,
     y: CANVAS_HEIGHT - 40,
-    w: PLATFORM_W * 1.5,
+    w: PLATFORM_W * 1.8,
     h: PLATFORM_H,
     type: 'normal',
     vx: 0,
@@ -105,7 +107,15 @@ function createInitialState(): GameState {
     const gap = rand(PLATFORM_GAP_MIN, PLATFORM_GAP_MAX)
     lastY -= gap
     const x = rand(PLATFORM_W, CANVAS_WIDTH - PLATFORM_W)
-    platforms.push(makePlatform(x, lastY, 0))
+    // First few platforms are always normal for easier start
+    if (i < 4) {
+      platforms.push({
+        x, y: lastY, w: PLATFORM_W, h: PLATFORM_H,
+        type: 'normal', vx: 0, broken: false, breakTimer: 0,
+      })
+    } else {
+      platforms.push(makePlatform(x, lastY, 0))
+    }
   }
 
   return {
@@ -116,6 +126,7 @@ function createInitialState(): GameState {
     playerVY: 0,
     platforms,
     particles: [],
+    landingRings: [],
     stars: generateStars(),
     score: 0,
     bestScore: Number(localStorage.getItem('skyleap_best') || '0'),
@@ -124,7 +135,12 @@ function createInitialState(): GameState {
     levelText: '',
     levelTextLife: 0,
     cameraY: 0,
+    targetCameraY: 0,
     combo: 0,
+    comboTimer: 0,
+    jumpStretch: 0,
+    speedLineAlpha: 0,
+    milestonesPassed: [],
   }
 }
 
@@ -135,7 +151,6 @@ export function useSkyLeap() {
   const rafRef = useRef(0)
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null)
   const inputXRef = useRef<number | null>(null)
-  const prevAltRef = useRef(0)
 
   const resetGame = useCallback(() => {
     const best = stateRef.current.bestScore
@@ -145,8 +160,8 @@ export function useSkyLeap() {
       phase: 'playing',
       bestScore: best,
       playerVY: JUMP_VELOCITY,
+      jumpStretch: 0.3,
     }
-    prevAltRef.current = 0
   }, [])
 
   const handlePointerDown = useCallback((clientX: number, canvasRect: DOMRect) => {
@@ -159,7 +174,6 @@ export function useSkyLeap() {
       resetGame()
       return
     }
-    // Track touch position for movement
     const scaleX = CANVAS_WIDTH / canvasRect.width
     inputXRef.current = (clientX - canvasRect.left) * scaleX
   }, [resetGame])
@@ -181,13 +195,19 @@ export function useSkyLeap() {
     let { playerX, playerY, playerVX, playerVY } = s
     const platforms = [...s.platforms]
     let particles = [...s.particles]
-    let { score, altitude, shake, levelText, levelTextLife, cameraY, combo } = s
+    let landingRings = [...s.landingRings]
+    let {
+      score, altitude, shake, levelText, levelTextLife,
+      cameraY, targetCameraY, combo, comboTimer,
+      jumpStretch, speedLineAlpha,
+    } = s
+    const milestonesPassed = [...s.milestonesPassed]
 
     // ── Input → horizontal movement ──
     if (inputXRef.current !== null) {
       const targetX = inputXRef.current
       const diff = targetX - playerX
-      playerVX += diff * 0.12
+      playerVX += diff * MOVE_ACCEL
     }
     playerVX *= FRICTION_AIR
     playerX += playerVX
@@ -202,6 +222,7 @@ export function useSkyLeap() {
     playerY += playerVY
 
     // ── Platform collision (only when falling) ──
+    let landed = false
     if (playerVY > 0) {
       for (const p of platforms) {
         if (p.broken && p.breakTimer <= 0) continue
@@ -210,39 +231,66 @@ export function useSkyLeap() {
         const dy = playerY + PLAYER_RADIUS - p.y + p.h / 2
 
         if (dx < p.w / 2 + PLAYER_RADIUS * 0.3 && dy >= 0 && dy < playerVY + 4) {
-          // Landing!
           playerY = p.y - p.h / 2 - PLAYER_RADIUS
+          landed = true
 
           if (p.type === 'breakable') {
+            // Small bounce then break
+            playerVY = WEAK_JUMP
             p.broken = true
-            p.breakTimer = 15
+            p.breakTimer = 18
             playBreak()
-            particles = [
-              ...particles,
-              ...spawnParticles(p.x, p.y, 6, '#dfe6e9'),
-            ]
-            shake = Math.max(shake, 0.15)
+            playWeakJump()
+            particles = [...particles, ...spawnParticles(p.x, p.y, 5, '#b2bec3')]
+            landingRings = [...landingRings, spawnLandingRing(p.x, p.y, '#dfe6e9')]
+            shake = Math.max(shake, 0.12)
+            jumpStretch = -0.25
           } else if (p.type === 'spring') {
             playerVY = SUPER_JUMP
             playSuperJump()
-            particles = [
-              ...particles,
-              ...spawnParticles(p.x, p.y, 8, '#ff6b6b'),
-            ]
+            particles = [...particles, ...spawnParticles(p.x, p.y, 8, '#ff6b6b')]
+            landingRings = [...landingRings, spawnLandingRing(p.x, p.y, '#ff6b6b')]
             combo += 1
-            shake = Math.max(shake, 0.2)
+            comboTimer = COMBO_DECAY_FRAMES
+            shake = Math.max(shake, 0.18)
+            jumpStretch = 0.5
+            if (combo > 2) playCombo(combo)
           } else {
             playerVY = JUMP_VELOCITY
             playJump()
-            particles = [
-              ...particles,
-              ...spawnParticles(p.x, p.y, 4, '#55efc4'),
-            ]
+            particles = [...particles, ...spawnParticles(p.x, p.y, 4, '#55efc4')]
+            landingRings = [...landingRings, spawnLandingRing(p.x, p.y, '#55efc4')]
             combo += 1
+            comboTimer = COMBO_DECAY_FRAMES
+            jumpStretch = -0.2
+            if (combo > 3) playCombo(combo)
           }
           break
         }
       }
+    }
+
+    // ── Combo decay ──
+    if (!landed && comboTimer > 0) {
+      comboTimer -= 1
+      if (comboTimer <= 0) {
+        combo = 0
+      }
+    }
+
+    // ── Jump stretch decay ──
+    if (jumpStretch > 0) {
+      jumpStretch = Math.max(0, jumpStretch - 0.03)
+    } else if (jumpStretch < 0) {
+      jumpStretch = Math.min(0, jumpStretch + 0.04)
+    }
+
+    // ── Speed line alpha ──
+    const absVY = Math.abs(playerVY)
+    if (absVY > 8) {
+      speedLineAlpha = Math.min(0.6, (absVY - 8) / 12)
+    } else {
+      speedLineAlpha = Math.max(0, speedLineAlpha - 0.03)
     }
 
     // ── Move moving platforms ──
@@ -253,18 +301,18 @@ export function useSkyLeap() {
           p.vx *= -1
         }
       }
-      // Break timer
       if (p.broken && p.breakTimer > 0) {
         p.breakTimer -= 1
       }
     }
 
-    // ── Camera scroll ──
-    const screenY = playerY - cameraY
+    // ── Camera scroll (smooth lerp) ──
+    const screenY = playerY - targetCameraY
     if (screenY < SCROLL_LINE) {
-      const diff = SCROLL_LINE - screenY
-      cameraY -= diff
+      targetCameraY = playerY - SCROLL_LINE
     }
+    // Smooth interpolation
+    cameraY += (targetCameraY - cameraY) * CAMERA_LERP
 
     // ── Altitude / Score ──
     altitude = Math.max(altitude, -cameraY * 0.5)
@@ -274,25 +322,29 @@ export function useSkyLeap() {
     }
 
     // Milestone check
-    const milestone = getMilestone(altitude)
-    if (milestone) {
-      levelText = milestone
-      levelTextLife = 60
-      playMilestone()
+    for (const m of MILESTONES) {
+      if (altitude >= m && !milestonesPassed.includes(m)) {
+        milestonesPassed.push(m)
+        levelText = `${m}m!`
+        levelTextLife = 60
+        playMilestone()
+      }
     }
 
     // ── Generate new platforms above ──
-    const topPlatY = Math.min(...platforms.map(p => p.y))
     const difficulty = altitude / 1000
-    while (topPlatY > cameraY - 200) {
+    let lowestTop = Math.min(...platforms.map(p => p.y))
+    let safetyCounter = 0
+    while (lowestTop > targetCameraY - 200 && safetyCounter < 5) {
+      safetyCounter++
       const gap = rand(
-        PLATFORM_GAP_MIN + Math.min(20, difficulty * 2),
-        PLATFORM_GAP_MAX + Math.min(40, difficulty * 4),
+        PLATFORM_GAP_MIN + Math.min(15, difficulty * 1.5),
+        PLATFORM_GAP_MAX + Math.min(30, difficulty * 3),
       )
-      const newY = Math.min(...platforms.map(p => p.y)) - gap
+      const newY = lowestTop - gap
       const newX = rand(PLATFORM_W, CANVAS_WIDTH - PLATFORM_W)
       platforms.push(makePlatform(newX, newY, difficulty))
-      if (newY < cameraY - 300) break
+      lowestTop = newY
     }
 
     // ── Remove platforms far below ──
@@ -305,13 +357,22 @@ export function useSkyLeap() {
         ...p,
         x: p.x + p.vx,
         y: p.y + p.vy,
-        vy: p.vy + 0.05,
+        vy: p.vy + 0.06,
         life: p.life - 1,
       }))
       .filter(p => p.life > 0)
 
+    // ── Update landing rings ──
+    landingRings = landingRings
+      .map(r => ({
+        ...r,
+        life: r.life - 1,
+        radius: r.radius + 2.5,
+      }))
+      .filter(r => r.life > 0)
+
     // ── Shake decay ──
-    if (shake > 0) shake = Math.max(0, shake - 0.04)
+    if (shake > 0) shake = Math.max(0, shake - 0.03)
 
     // ── Level text decay ──
     if (levelTextLife > 0) levelTextLife -= 1
@@ -322,7 +383,7 @@ export function useSkyLeap() {
     if (playerScreenY > CANVAS_HEIGHT + 50) {
       phase = 'gameover'
       playGameOver()
-      shake = 0.6
+      shake = 0.5
 
       const newBest = Math.max(s.bestScore, score)
       if (newBest > s.bestScore) {
@@ -335,6 +396,7 @@ export function useSkyLeap() {
         playerX, playerY, playerVX, playerVY,
         platforms: filtered,
         particles,
+        landingRings,
         score,
         bestScore: Math.max(s.bestScore, score),
         altitude,
@@ -342,7 +404,12 @@ export function useSkyLeap() {
         levelText,
         levelTextLife,
         cameraY,
+        targetCameraY,
         combo,
+        comboTimer,
+        jumpStretch,
+        speedLineAlpha,
+        milestonesPassed,
       }
       return
     }
@@ -353,13 +420,19 @@ export function useSkyLeap() {
       playerX, playerY, playerVX, playerVY,
       platforms: filtered,
       particles,
+      landingRings,
       score,
       altitude,
       shake,
       levelText,
       levelTextLife,
       cameraY,
+      targetCameraY,
       combo,
+      comboTimer,
+      jumpStretch,
+      speedLineAlpha,
+      milestonesPassed,
     }
   }, [])
 
